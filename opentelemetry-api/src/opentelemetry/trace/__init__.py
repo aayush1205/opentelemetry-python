@@ -73,17 +73,17 @@ either implicit or explicit context propagation consistently throughout.
     `set_tracer_provider`.
 """
 
-
 import os
 import typing
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from enum import Enum
 from logging import getLogger
 from typing import Iterator, Optional, Sequence, cast
 
+from deprecated import deprecated
+
 from opentelemetry import context as context_api
-from opentelemetry.attributes import BoundedAttributes  # type: ignore
+from opentelemetry.attributes import BoundedAttributes
 from opentelemetry.context.context import Context
 from opentelemetry.environment_variables import OTEL_PYTHON_TRACER_PROVIDER
 from opentelemetry.trace.propagation import (
@@ -108,6 +108,7 @@ from opentelemetry.trace.span import (
 )
 from opentelemetry.trace.status import Status, StatusCode
 from opentelemetry.util import types
+from opentelemetry.util._decorator import _agnosticcontextmanager
 from opentelemetry.util._once import Once
 from opentelemetry.util._providers import _load_provider
 
@@ -142,13 +143,17 @@ class Link(_LinkBase):
         attributes: types.Attributes = None,
     ) -> None:
         super().__init__(context)
-        self._attributes = BoundedAttributes(
-            attributes=attributes
-        )  # type: types.Attributes
+        self._attributes = attributes
 
     @property
     def attributes(self) -> types.Attributes:
         return self._attributes
+
+    @property
+    def dropped_attributes(self) -> int:
+        if isinstance(self._attributes, BoundedAttributes):
+            return self._attributes.dropped
+        return 0
 
 
 _Links = Optional[Sequence[Link]]
@@ -190,6 +195,7 @@ class TracerProvider(ABC):
         instrumenting_module_name: str,
         instrumenting_library_version: typing.Optional[str] = None,
         schema_url: typing.Optional[str] = None,
+        attributes: typing.Optional[types.Attributes] = None,
     ) -> "Tracer":
         """Returns a `Tracer` for use by the given instrumentation library.
 
@@ -200,8 +206,12 @@ class TracerProvider(ABC):
         vs.  a functional tracer).
 
         Args:
-            instrumenting_module_name: The name of the instrumenting module
-                (usually just ``__name__``).
+            instrumenting_module_name: The uniquely identifiable name for instrumentation
+                scope, such as instrumentation library, package, module or class name.
+                ``__name__`` may not be used as this can result in
+                different tracer names if the tracers are in different files.
+                It is better to use a fixed string that can be imported where
+                needed and used consistently as the name of the tracer.
 
                 This should *not* be the name of the module that is
                 instrumented but the name of the module doing the instrumentation.
@@ -210,13 +220,14 @@ class TracerProvider(ABC):
 
             instrumenting_library_version: Optional. The version string of the
                 instrumenting library.  Usually this should be the same as
-                ``pkg_resources.get_distribution(instrumenting_library_name).version``.
+                ``importlib.metadata.version(instrumenting_library_name)``.
 
             schema_url: Optional. Specifies the Schema URL of the emitted telemetry.
+            attributes: Optional. Specifies the attributes of the emitted telemetry.
         """
 
 
-class _DefaultTracerProvider(TracerProvider):
+class NoOpTracerProvider(TracerProvider):
     """The default TracerProvider, used when no implementation is available.
 
     All operations are no-op.
@@ -227,9 +238,18 @@ class _DefaultTracerProvider(TracerProvider):
         instrumenting_module_name: str,
         instrumenting_library_version: typing.Optional[str] = None,
         schema_url: typing.Optional[str] = None,
+        attributes: typing.Optional[types.Attributes] = None,
     ) -> "Tracer":
         # pylint:disable=no-self-use,unused-argument
-        return _DefaultTracer()
+        return NoOpTracer()
+
+
+@deprecated(version="1.9.0", reason="You should use NoOpTracerProvider")  # type: ignore
+class _DefaultTracerProvider(NoOpTracerProvider):
+    """The default TracerProvider, used when no implementation is available.
+
+    All operations are no-op.
+    """
 
 
 class ProxyTracerProvider(TracerProvider):
@@ -238,17 +258,20 @@ class ProxyTracerProvider(TracerProvider):
         instrumenting_module_name: str,
         instrumenting_library_version: typing.Optional[str] = None,
         schema_url: typing.Optional[str] = None,
+        attributes: typing.Optional[types.Attributes] = None,
     ) -> "Tracer":
         if _TRACER_PROVIDER:
             return _TRACER_PROVIDER.get_tracer(
                 instrumenting_module_name,
                 instrumenting_library_version,
                 schema_url,
+                attributes,
             )
         return ProxyTracer(
             instrumenting_module_name,
             instrumenting_library_version,
             schema_url,
+            attributes,
         )
 
 
@@ -304,7 +327,7 @@ class Tracer(ABC):
             record_exception: Whether to record any exceptions raised within the
                 context as error event on the span.
             set_status_on_exception: Only relevant if the returned span is used
-                in a with/context manager. Defines wether the span status will
+                in a with/context manager. Defines whether the span status will
                 be automatically set to ERROR when an uncaught exception is
                 raised in the span with block. The span status won't be set by
                 this mechanism if it was previously set manually.
@@ -313,7 +336,7 @@ class Tracer(ABC):
             The newly-created span.
         """
 
-    @contextmanager  # type: ignore
+    @_agnosticcontextmanager
     @abstractmethod
     def start_as_current_span(
         self,
@@ -338,7 +361,7 @@ class Tracer(ABC):
 
             with tracer.start_as_current_span("one") as parent:
                 parent.add_event("parent's event")
-                with trace.start_as_current_span("two") as child:
+                with tracer.start_as_current_span("two") as child:
                     child.add_event("child's event")
                     trace.get_current_span()  # returns child
                 trace.get_current_span()      # returns parent
@@ -357,6 +380,14 @@ class Tracer(ABC):
             with opentelemetry.trace.use_span(span, end_on_exit=True):
                 do_work()
 
+        This can also be used as a decorator::
+
+            @tracer.start_as_current_span("name")
+            def function():
+                ...
+
+            function()
+
         Args:
             name: The name of the span to be created.
             context: An optional Context containing the span's parent. Defaults to the
@@ -369,7 +400,7 @@ class Tracer(ABC):
             record_exception: Whether to record any exceptions raised within the
                 context as error event on the span.
             set_status_on_exception: Only relevant if the returned span is used
-                in a with/context manager. Defines wether the span status will
+                in a with/context manager. Defines whether the span status will
                 be automatically set to ERROR when an uncaught exception is
                 raised in the span with block. The span status won't be set by
                 this mechanism if it was previously set manually.
@@ -388,12 +419,14 @@ class ProxyTracer(Tracer):
         instrumenting_module_name: str,
         instrumenting_library_version: typing.Optional[str] = None,
         schema_url: typing.Optional[str] = None,
+        attributes: typing.Optional[types.Attributes] = None,
     ):
         self._instrumenting_module_name = instrumenting_module_name
         self._instrumenting_library_version = instrumenting_library_version
         self._schema_url = schema_url
+        self._attributes = attributes
         self._real_tracer: Optional[Tracer] = None
-        self._noop_tracer = _DefaultTracer()
+        self._noop_tracer = NoOpTracer()
 
     @property
     def _tracer(self) -> Tracer:
@@ -405,6 +438,7 @@ class ProxyTracer(Tracer):
                 self._instrumenting_module_name,
                 self._instrumenting_library_version,
                 self._schema_url,
+                self._attributes,
             )
             return self._real_tracer
         return self._noop_tracer
@@ -412,11 +446,13 @@ class ProxyTracer(Tracer):
     def start_span(self, *args, **kwargs) -> Span:  # type: ignore
         return self._tracer.start_span(*args, **kwargs)  # type: ignore
 
-    def start_as_current_span(self, *args, **kwargs) -> Span:  # type: ignore
-        return self._tracer.start_as_current_span(*args, **kwargs)  # type: ignore
+    @_agnosticcontextmanager  # type: ignore
+    def start_as_current_span(self, *args, **kwargs) -> Iterator[Span]:
+        with self._tracer.start_as_current_span(*args, **kwargs) as span:  # type: ignore
+            yield span
 
 
-class _DefaultTracer(Tracer):
+class NoOpTracer(Tracer):
     """The default Tracer, used when no Tracer implementation is available.
 
     All operations are no-op.
@@ -436,7 +472,7 @@ class _DefaultTracer(Tracer):
         # pylint: disable=unused-argument,no-self-use
         return INVALID_SPAN
 
-    @contextmanager  # type: ignore
+    @_agnosticcontextmanager
     def start_as_current_span(
         self,
         name: str,
@@ -453,6 +489,14 @@ class _DefaultTracer(Tracer):
         yield INVALID_SPAN
 
 
+@deprecated(version="1.9.0", reason="You should use NoOpTracer")  # type: ignore
+class _DefaultTracer(NoOpTracer):
+    """The default Tracer, used when no Tracer implementation is available.
+
+    All operations are no-op.
+    """
+
+
 _TRACER_PROVIDER_SET_ONCE = Once()
 _TRACER_PROVIDER: Optional[TracerProvider] = None
 _PROXY_TRACER_PROVIDER = ProxyTracerProvider()
@@ -463,6 +507,7 @@ def get_tracer(
     instrumenting_library_version: typing.Optional[str] = None,
     tracer_provider: Optional[TracerProvider] = None,
     schema_url: typing.Optional[str] = None,
+    attributes: typing.Optional[types.Attributes] = None,
 ) -> "Tracer":
     """Returns a `Tracer` for use by the given instrumentation library.
 
@@ -474,7 +519,10 @@ def get_tracer(
     if tracer_provider is None:
         tracer_provider = get_tracer_provider()
     return tracer_provider.get_tracer(
-        instrumenting_module_name, instrumenting_library_version, schema_url
+        instrumenting_module_name,
+        instrumenting_library_version,
+        schema_url,
+        attributes,
     )
 
 
@@ -492,7 +540,7 @@ def _set_tracer_provider(tracer_provider: TracerProvider, log: bool) -> None:
 def set_tracer_provider(tracer_provider: TracerProvider) -> None:
     """Sets the current global :class:`~.TracerProvider` object.
 
-    This can only be done once, a warning will be logged if any furter attempt
+    This can only be done once, a warning will be logged if any further attempt
     is made.
     """
     _set_tracer_provider(tracer_provider, log=True)
@@ -514,7 +562,7 @@ def get_tracer_provider() -> TracerProvider:
     return cast("TracerProvider", _TRACER_PROVIDER)
 
 
-@contextmanager  # type: ignore
+@_agnosticcontextmanager
 def use_span(
     span: Span,
     end_on_exit: bool = False,
@@ -530,7 +578,7 @@ def use_span(
         record_exception: Whether to record any exceptions raised within the
             context as error event on the span.
         set_status_on_exception: Only relevant if the returned span is used
-            in a with/context manager. Defines wether the span status will
+            in a with/context manager. Defines whether the span status will
             be automatically set to ERROR when an uncaught exception is
             raised in the span with block. The span status won't be set by
             this mechanism if it was previously set manually.
@@ -542,7 +590,7 @@ def use_span(
         finally:
             context_api.detach(token)
 
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:  # pylint: disable=broad-exception-caught
         if isinstance(span, Span) and span.is_recording():
             # Record the exception as an event
             if record_exception:
@@ -556,6 +604,11 @@ def use_span(
                         description=f"{type(exc).__name__}: {exc}",
                     )
                 )
+
+        # This causes parent spans to set their status to ERROR and to record
+        # an exception as an event if a child span raises an exception even if
+        # such child span was started with both record_exception and
+        # set_status_on_exception attributes set to False.
         raise
 
     finally:

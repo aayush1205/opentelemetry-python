@@ -7,12 +7,12 @@ from opentelemetry.test.globals_test import TraceGlobalsTest
 from opentelemetry.trace.status import Status, StatusCode
 
 
-class TestSpan(trace.NonRecordingSpan):
+class SpanTest(trace.NonRecordingSpan):
     has_ended = False
     recorded_exception = None
     recorded_status = Status(status_code=StatusCode.UNSET)
 
-    def set_status(self, status):
+    def set_status(self, status, description=None):
         self.recorded_status = status
 
     def end(self, end_time=None):
@@ -33,10 +33,12 @@ class TestGlobals(TraceGlobalsTest, unittest.TestCase):
     def test_get_tracer(mock_tracer_provider):  # type: ignore
         """trace.get_tracer should proxy to the global tracer provider."""
         trace.get_tracer("foo", "var")
-        mock_tracer_provider.get_tracer.assert_called_with("foo", "var", None)
+        mock_tracer_provider.get_tracer.assert_called_with(
+            "foo", "var", None, None
+        )
         mock_provider = Mock()
         trace.get_tracer("foo", "var", mock_provider)
-        mock_provider.get_tracer.assert_called_with("foo", "var", None)
+        mock_provider.get_tracer.assert_called_with("foo", "var", None, None)
 
 
 class TestGlobalsConcurrency(TraceGlobalsTest, ConcurrencyTestBase):
@@ -77,17 +79,16 @@ class TestGlobalsConcurrency(TraceGlobalsTest, ConcurrencyTestBase):
             mock_tps_with_any_call[0].get_tracer.call_count, num_threads
         )
 
-        # should have warned everytime except for the successful set
+        # should have warned every time except for the successful set
         self.assertEqual(mock_logger.warning.call_count, num_threads - 1)
 
 
 class TestTracer(unittest.TestCase):
     def setUp(self):
-        # pylint: disable=protected-access
-        self.tracer = trace._DefaultTracer()
+        self.tracer = trace.NoOpTracer()
 
     def test_get_current_span(self):
-        """_DefaultTracer's start_span will also
+        """NoOpTracer's start_span will also
         be retrievable via get_current_span
         """
         self.assertEqual(trace.get_current_span(), trace.INVALID_SPAN)
@@ -110,8 +111,7 @@ class TestUseTracer(unittest.TestCase):
         self.assertEqual(trace.get_current_span(), trace.INVALID_SPAN)
 
     def test_use_span_end_on_exit(self):
-
-        test_span = TestSpan(trace.INVALID_SPAN_CONTEXT)
+        test_span = SpanTest(trace.INVALID_SPAN_CONTEXT)
 
         with trace.use_span(test_span):
             pass
@@ -125,7 +125,7 @@ class TestUseTracer(unittest.TestCase):
         class TestUseSpanException(Exception):
             pass
 
-        test_span = TestSpan(trace.INVALID_SPAN_CONTEXT)
+        test_span = SpanTest(trace.INVALID_SPAN_CONTEXT)
         exception = TestUseSpanException("test exception")
         with self.assertRaises(TestUseSpanException):
             with trace.use_span(test_span):
@@ -137,7 +137,7 @@ class TestUseTracer(unittest.TestCase):
         class TestUseSpanException(Exception):
             pass
 
-        test_span = TestSpan(trace.INVALID_SPAN_CONTEXT)
+        test_span = SpanTest(trace.INVALID_SPAN_CONTEXT)
         with self.assertRaises(TestUseSpanException):
             with trace.use_span(test_span):
                 raise TestUseSpanException("test error")

@@ -112,15 +112,17 @@ from opentelemetry.context import (
 from opentelemetry.propagate import get_global_textmap
 from opentelemetry.shim.opentracing_shim import util
 from opentelemetry.shim.opentracing_shim.version import __version__
-from opentelemetry.trace import INVALID_SPAN_CONTEXT, Link, NonRecordingSpan
-from opentelemetry.trace import SpanContext as OtelSpanContext
-from opentelemetry.trace import Tracer as OtelTracer
 from opentelemetry.trace import (
+    INVALID_SPAN_CONTEXT,
+    Link,
+    NonRecordingSpan,
     TracerProvider,
     get_current_span,
     set_span_in_context,
     use_span,
 )
+from opentelemetry.trace import SpanContext as OtelSpanContext
+from opentelemetry.trace import Tracer as OtelTracer
 from opentelemetry.util.types import Attributes
 
 ValueT = TypeVar("ValueT", int, float, bool, str)
@@ -387,6 +389,7 @@ class ScopeShim(Scope):
                 :meth:`opentelemetry.trace.use_span`.
         """
 
+        # pylint: disable=unnecessary-dunder-call
         otel_span = span_cm.__enter__()
         span_context = SpanContextShim(otel_span.get_span_context())
         span = SpanShim(manager.tracer, span_context, otel_span)
@@ -730,7 +733,7 @@ class TracerShim(Tracer):
         """
 
         # pylint: disable=redefined-builtin
-        # This implementation does not perform the extracing by itself but
+        # This implementation does not perform the extracting by itself but
         # uses the configured propagators in opentelemetry.propagators.
         # TODO: Support Format.BINARY once it is supported in
         # opentelemetry-python.
